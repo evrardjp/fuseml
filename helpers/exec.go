@@ -7,7 +7,6 @@ import (
 	"io/ioutil"
 	"os"
 	"os/exec"
-	"strings"
 	"time"
 
 	"github.com/codeskyblue/kexec"
@@ -21,6 +20,11 @@ type ExternalFuncWithString func() (output string, err error)
 type ExternalFunc func() (err error)
 
 func RunProc(cmd, dir string, toStdout bool) (string, error) {
+	return RunProcEnv(cmd, dir, toStdout, make([]string, 0))
+}
+
+// run process with the list of env variables
+func RunProcEnv(cmd, dir string, toStdout bool, env []string) (string, error) {
 	if os.Getenv("DEBUG") == "true" {
 		fmt.Println("Executing ", cmd)
 	}
@@ -33,6 +37,9 @@ func RunProc(cmd, dir string, toStdout bool) (string, error) {
 	} else {
 		p.Stdout = &b
 		p.Stderr = &b
+	}
+	for _, e := range env {
+		p.Env = append(os.Environ(), e)
 	}
 
 	p.Dir = dir
@@ -112,6 +119,16 @@ func WaitForCommandCompletion(ui *ui.UI, message string, funk ExternalFuncWithSt
 	return funk()
 }
 
+// WaitForKubernetesResourceToExist waits for a kubernetes resource to exist for 'timeout' seconds
+func WaitForKubernetesResourceToExist(ui *ui.UI, namespace, kind, name string, timeout int) (string, error) {
+	s := ui.Progressf(" Waiting for %s %s", kind, name)
+	defer s.Stop()
+
+	return ExecToSuccessWithTimeout(func() (string, error) {
+		return Kubectl(fmt.Sprintf("get %s %s -n %s", kind, name, namespace))
+	}, time.Duration(timeout)*time.Second, time.Second)
+}
+
 // ExecToSuccessWithTimeout retries the given function with stirng & error return,
 // until it either succeeds of the timeout is reached. It retries every "interval" duration.
 func ExecToSuccessWithTimeout(funk ExternalFuncWithString, timeout, interval time.Duration) (string, error) {
@@ -137,7 +154,7 @@ func RunToSuccessWithTimeout(funk ExternalFunc, timeout, interval time.Duration)
 	for {
 		select {
 		case <-timeoutChan:
-			return fmt.Errorf("Timed out after %s", timeout.String())
+			return fmt.Errorf("timed out after %s", timeout.String())
 		default:
 			if err := funk(); err != nil {
 				time.Sleep(interval)
@@ -146,33 +163,4 @@ func RunToSuccessWithTimeout(funk ExternalFunc, timeout, interval time.Duration)
 			}
 		}
 	}
-}
-
-// OpenSSLSubjectHash return the subject_hash of the given CA certificate as
-// returned by this command:
-// openssl x509 -hash -noout
-// https://www.openssl.org/docs/man1.0.2/man1/x509.html
-// TODO: The way this function is implemented, it makes a system call to openssl
-// thus making openssl a dependency. There must be a way to calculate the hash
-// in Go so we don't need openssl.
-func OpenSSLSubjectHash(cert string) (string, error) {
-	_, err := exec.LookPath("openssl")
-	if err != nil {
-		return "", errors.Wrap(err, "openssl not in path")
-	}
-
-	cmd := exec.Command("openssl", "x509", "-hash", "-noout")
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		return "", err
-	}
-
-	go func() {
-		defer stdin.Close()
-		io.WriteString(stdin, cert)
-	}()
-
-	out, err := cmd.CombinedOutput()
-
-	return strings.TrimSpace(string(out)), err
 }

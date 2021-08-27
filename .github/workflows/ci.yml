@@ -1,0 +1,125 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+    paths-ignore:
+      - docs/**
+      - README.md
+      - LICENSE
+      - .gitlint
+      - .gitignore
+  pull_request:
+    branches: [ main ]
+    paths-ignore:
+      - docs/**
+      - README.md
+      - LICENSE
+      - .gitlint
+      - .gitignore
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+
+      - name: Setup Go
+        uses: actions/setup-go@v2
+        with:
+          go-version: '^1.16'
+
+      - name: Cache Go modules
+        uses: actions/cache@v2
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ github.job }}-${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ github.job }}-${{ runner.os }}-go
+
+      - name: Lint
+        run: |
+          make lint
+
+  unit-tests:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+
+      - name: Setup Go
+        uses: actions/setup-go@v2
+        with:
+          go-version: '^1.16'
+
+      - name: Cache Go modules
+        uses: actions/cache@v2
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ github.job }}-${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ github.job }}-${{ runner.os }}-go-
+
+      - name: Setup Ginkgo Test Framework
+        run: |
+          go get -u github.com/onsi/ginkgo/ginkgo
+
+      - name: Run unit tests
+        run: |
+          make test
+
+  mlflow-e2e:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Free disk space
+        run: |
+          echo "Available storage:"
+          df -h
+          echo
+          echo -n "  Removing: .NET (frees ~22GB)"
+          sudo rm -rf /usr/share/dotnet
+          echo "... done"
+          echo
+          echo "Available storage:"
+          df -h
+
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Setup Go
+        uses: actions/setup-go@v2
+        with:
+          go-version: '^1.16'
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v1
+
+      - name: Cache Go modules
+        uses: actions/cache@v2
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ github.job }}-${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ github.job }}-${{ runner.os }}-go-
+
+      - name: Build fuseml-installer
+        run: make build
+
+      - name: Install k3d
+        run: make k3d-install
+
+      - name: Create k8s cluster
+        run: make new-test-cluster
+
+      - name: Install FuseML
+        run: |
+          ./dist/fuseml-installer version
+          make fuseml-install-with-extensions
+
+      - name: Run mlflow-e2e
+        run: |
+          make mlflow-e2e
