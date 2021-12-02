@@ -2,13 +2,11 @@ package acceptance_test
 
 import (
 	"bytes"
-	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
-	"net/http"
 	"os"
 	"os/exec"
 	"path"
@@ -85,14 +83,17 @@ var _ = SynchronizedBeforeSuite(func() []byte {
 		))
 	}
 
+	fmt.Printf("Installing FuseML on node %d\n", config.GinkgoConfig.ParallelNode)
+	installFuseml()
+
 	if serve == "knative" {
 		fmt.Printf("Installing Knative on node %d\n", config.GinkgoConfig.ParallelNode)
 		installKnative()
 	}
 
-	if serve == "kfserving" {
-		fmt.Printf("Installing KFServing on node %d\n", config.GinkgoConfig.ParallelNode)
-		installKfserving()
+	if serve == "kserve" {
+		fmt.Printf("Installing KServe on node %d\n", config.GinkgoConfig.ParallelNode)
+		installKserve()
 	}
 
 	if strings.Contains(serve, "seldon") {
@@ -100,8 +101,7 @@ var _ = SynchronizedBeforeSuite(func() []byte {
 		installSeldon()
 	}
 
-	fmt.Printf("Installing FuseML on node %d\n", config.GinkgoConfig.ParallelNode)
-	installFuseml()
+	upgradeFuseml()
 })
 
 var _ = AfterEach(func() {
@@ -180,10 +180,10 @@ func installKnative() {
 	}
 }
 
-func installKfserving() {
-	_, err := RunProc("make kfserving-install", "..", true)
+func installKserve() {
+	_, err := RunProc("make kserve-install", "..", true)
 	if err != nil {
-		panic("Installing KFServing failed: " + err.Error())
+		panic("Installing KServe failed: " + err.Error())
 	}
 }
 
@@ -231,7 +231,7 @@ func buildFuseml() {
 }
 
 func copyFuseml() {
-	output, err := RunProc("cp dist/fuseml "+nodeTmpDir+"/", "..", false)
+	output, err := RunProc("cp dist/fuseml-installer "+nodeTmpDir+"/", "..", false)
 	if err != nil {
 		panic(fmt.Sprintf("Couldn't copy FuseML: %s\n %s\n"+err.Error(), output))
 	}
@@ -239,6 +239,10 @@ func copyFuseml() {
 
 func installFuseml() (string, error) {
 	return Fuseml("install", "")
+}
+
+func upgradeFuseml() (string, error) {
+	return Fuseml("upgrade", "")
 }
 
 func uninstallFuseml() (string, error) {
@@ -262,7 +266,7 @@ func Fuseml(command string, dir string) (string, error) {
 		commandDir = dir
 	}
 
-	cmd := fmt.Sprintf(nodeTmpDir+"/fuseml --verbosity 1 %s", command)
+	cmd := fmt.Sprintf(nodeTmpDir+"/fuseml-installer --verbosity 1 %s", command)
 
 	return RunProc(cmd, commandDir, true)
 }
@@ -290,46 +294,4 @@ func checkDependencies() error {
 	}
 
 	return errors.New("Please check your PATH, some of our dependencies were not found")
-}
-
-func predictMLFlowApp(url string, serve string) string {
-	commonData := "[[12.8, 0.029, 0.48, 0.98, 6.2, 29, 7.33, 1.2, 0.39, 90, 0.86]]"
-	var data []byte
-	switch serve {
-	case "knative", "deployment":
-		data = []byte(fmt.Sprintf(`{
-			"columns":["alcohol", "chlorides", "citric acid", "density", "fixed acidity",
-				"free sulfur dioxide", "pH", "residual sugar", "sulphates", "total sulfur dioxide",
-				"volatile acidity"], "data": %s
-		}`, commonData))
-	case "kfserving":
-		data = []byte(fmt.Sprintf(`{
-			"inputs": [{"name": "input-0", "shape": [1, 11], "datatype": "FP32", "data": %s}]
-		}`, commonData))
-	case "seldon_sklearn", "seldon_mlflow":
-		data = []byte(fmt.Sprintf(`{"data": {"ndarray": %s}}`, commonData))
-	}
-
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(data))
-	if err != nil {
-		panic(err)
-	}
-	req.Header.Set("format", "pandas-split")
-	req.Header.Set("Content-Type", "application/json")
-
-	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-	}
-	client := &http.Client{Transport: tr}
-	resp, err := client.Do(req)
-	if err != nil {
-		panic(err)
-	}
-	defer resp.Body.Close()
-	if resp.Status != "200 OK" {
-		panic(fmt.Sprintf("expected 200 OK, got %q", resp.Status))
-	}
-
-	body, _ := ioutil.ReadAll(resp.Body)
-	return string(body)
 }

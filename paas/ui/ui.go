@@ -211,7 +211,7 @@ func (u *Message) Msg(message string) {
 		case show:
 			switch interaction.valueType {
 			case tBool:
-				fmt.Printf("%s: %s\n", emoji.Sprint(interaction.name), color.MagentaString("%b", interaction.value))
+				fmt.Printf("%s: %s\n", emoji.Sprint(interaction.name), color.MagentaString("%t", interaction.value))
 			case tInt:
 				fmt.Printf("%s: %s\n", emoji.Sprint(interaction.name), color.CyanString("%d", interaction.value))
 			case tString:
@@ -362,6 +362,11 @@ func (u *Message) WithAskInt(name string, result *int) *Message {
 		value:     result,
 	})
 	return u
+}
+
+// Verbose returns true if the verbosity level is high
+func (u *UI) Verbose() bool {
+	return u.verbosity > 0
 }
 
 func readBool() bool {

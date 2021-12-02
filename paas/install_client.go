@@ -76,15 +76,15 @@ func (c *InstallClient) Install(cmd *cobra.Command, options *kubernetes.Installa
 	// to report all problems at once, instead of early and
 	// piecemal.
 
-	deployment := deployments.Traefik{Timeout: DefaultTimeoutSec}
+	deployment := deployments.Istio{Timeout: DefaultTimeoutSec}
 
 	details.Info("deploy", "Deployment", deployment.ID())
-	deployment.Deploy(c.kubeClient, c.ui, options.ForDeployment(deployment.ID()))
+	err = deployment.Deploy(c.kubeClient, c.ui, options.ForDeployment(deployment.ID()))
 	if err != nil {
 		return err
 	}
 
-	// Try to give a omg.howdoi.website domain if the user didn't specify one
+	// Try to give a nip.io domain if the user didn't specify one
 	domain, err := options.GetOpt("system_domain", "")
 	if err != nil {
 		return err
@@ -96,7 +96,7 @@ func (c *InstallClient) Install(cmd *cobra.Command, options *kubernetes.Installa
 		return err
 	}
 	if domain.Value.(string) == "" {
-		return errors.New("You didn't provide a system_domain and we were unable to setup a omg.howdoi.website domain (couldn't find an ExternalIP)")
+		return errors.New("You didn't provide a system_domain and we were unable to setup a nip.io domain (couldn't find an ExternalIP)")
 	}
 	if c.kubeClient.HasKnative() {
 		err = c.setDomainForKnative(domain.Value.(string))
@@ -108,12 +108,11 @@ func (c *InstallClient) Install(cmd *cobra.Command, options *kubernetes.Installa
 	c.ui.Success().Msg("Created system_domain: " + domain.Value.(string))
 
 	for _, deployment := range []kubernetes.Deployment{
-		&deployments.Quarks{Timeout: DefaultTimeoutSec},
 		&deployments.Workloads{Timeout: DefaultTimeoutSec},
-		&deployments.MLflow{Timeout: DefaultTimeoutSec},
 		&deployments.Gitea{Timeout: DefaultTimeoutSec},
 		&deployments.Registry{Timeout: DefaultTimeoutSec},
 		&deployments.Tekton{Timeout: DefaultTimeoutSec},
+		&deployments.Core{Timeout: DefaultTimeoutSec},
 	} {
 		details.Info("deploy", "Deployment", deployment.ID())
 
@@ -123,17 +122,199 @@ func (c *InstallClient) Install(cmd *cobra.Command, options *kubernetes.Installa
 		}
 	}
 
+	if err := downloadFuseMLCLI(c.ui, domain.Value.(string)); err != nil {
+		return err
+	}
+
+	extensions, err := options.GetOpt("extensions", "")
+	if err != nil {
+		return err
+	}
+	details.Info("installing extensions")
+	if err := c.handleExtensions("install", extensions.Value.([]string), options, true); err != nil {
+		return err
+	}
+
 	c.ui.Success().WithStringValue("System domain", domain.Value.(string)).Msg("FuseML installed.")
 
 	return nil
 }
 
+// find out the required extensions for an extension that is passed as an argument
+// return list of all requirements, including the given extension itself
+func (c *InstallClient) getRequirementsForExtension(extension *deployments.Extension, repo string) ([]*deployments.Extension, error) {
+
+	ret := []*deployments.Extension{}
+	name := extension.Name
+	err := extension.LoadDescription()
+	if err != nil {
+		return ret, errors.New(fmt.Sprintf("Failed to load description file of required extension %s: %s", name, err.Error()))
+	}
+
+	for _, req := range extension.Desc.Requires {
+
+		reqExt := deployments.NewExtension(req, repo, DefaultTimeoutSec, c.ui.Verbose())
+		sortedRequiredExtensions, _ := c.getRequirementsForExtension(reqExt, repo)
+
+		for _, e := range sortedRequiredExtensions {
+			ret = append(ret, e)
+		}
+	}
+	ret = append(ret, extension)
+	return ret, nil
+}
+
+// install or uninstall given list of extensions
+func (c *InstallClient) handleExtensions(action string, extensions []string, options *kubernetes.InstallationOptions, withDeps bool) error {
+
+	if len(extensions) == 0 {
+		return nil
+	}
+
+	extensionRepo, err := options.GetOpt("extensions_repository", "")
+	if err != nil {
+		return err
+	}
+	// we do not know the size as the list of needs to be eventually installed could be bigger than original
+	sortedExtensions := []*deployments.Extension{}
+	// remember what we've already added to the sorted queue and avoid duplicates
+	exensionsInQueue := make(map[string]bool)
+
+	// in first loop, go over extensions and find their dependencies
+	for _, name := range extensions {
+
+		extension := deployments.NewExtension(name, extensionRepo.Value.(string), DefaultTimeoutSec, c.ui.Verbose())
+
+		requiredExtensions, err := c.getRequirementsForExtension(extension, extensionRepo.Value.(string))
+		if err != nil {
+			return err
+		}
+
+		for _, e := range requiredExtensions {
+			if !exensionsInQueue[e.Name] {
+				if action == "install" {
+					sortedExtensions = append(sortedExtensions, e)
+				} else {
+					// for uninstallation, the order must be reversed
+					sortedExtensions = append([]*deployments.Extension{e}, sortedExtensions...)
+				}
+				exensionsInQueue[e.Name] = true
+			}
+		}
+	}
+
+	for _, extension := range sortedExtensions {
+
+		switch action {
+		case "install":
+			c.ui.Note().KeeplineUnder(1).Msg(fmt.Sprintf("Installing extension '%s'...", extension.Name))
+			err = extension.Install(c.kubeClient, c.ui, options)
+			if err != nil {
+				return errors.New(fmt.Sprintf("Failed to install extension %s: %s", extension.Name, err.Error()))
+			}
+
+			c.ui.Note().Msg(fmt.Sprintf("Registering extension '%s'...", extension.Name))
+			err = extension.Register(c.kubeClient, c.ui, options)
+			if err != nil {
+				return errors.New(fmt.Sprintf("Failed to register extension %s: %s", extension.Name, err.Error()))
+			}
+		case "uninstall":
+			// uninstall dependencies only when explicitly required on command line or with the command that uninstalls whole fuseml
+			// (https://github.com/fuseml/fuseml/issues/198)
+			if withDeps || helpers.StringInSlice(extensions, extension.Name) {
+				c.ui.Note().KeeplineUnder(1).Msg(fmt.Sprintf("Unregistering extension '%s'...", extension.Name))
+				err = extension.UnRegister(c.kubeClient, c.ui, options)
+				if err != nil {
+					return errors.New(fmt.Sprintf("Failed to unregister extension %s: %s", extension.Name, err.Error()))
+				}
+
+				c.ui.Note().KeeplineUnder(1).Msg(fmt.Sprintf("Removing extension '%s'...", extension.Name))
+				err = extension.Uninstall(c.kubeClient, c.ui, options)
+				if err != nil {
+					return errors.New(fmt.Sprintf("Failed to uninstall extension %s: %s", extension.Name, err.Error()))
+				}
+			} else {
+				c.ui.Note().Msg(fmt.Sprintf("Skipped removal of extension '%s'", extension.Name))
+			}
+		default:
+			return errors.New(fmt.Sprintf("Unsupported action %s", action))
+		}
+	}
+	return nil
+}
+
+func (c *InstallClient) listRegisteredExtensions(options *kubernetes.InstallationOptions) error {
+
+	client := deployments.NewHttpClient(c.ui.Verbose())
+	exts, err := deployments.GetRegisteredExtensions(options, client)
+	if err != nil {
+		return err
+	}
+	msg := c.ui.Success().WithTable("Name", "Version", "Description")
+	for _, ext := range exts {
+		msg = msg.WithTableRow(*ext.ID, *ext.Version, *ext.Description)
+	}
+	msg.Msg("Registered FuseML extensions:")
+
+	return nil
+}
+
 // Uninstall removes fuseml from the cluster.
-func (c *InstallClient) Uninstall(cmd *cobra.Command) error {
+func (c *InstallClient) Uninstall(cmd *cobra.Command, options *kubernetes.InstallationOptions) error {
 	log := c.Log.WithName("Uninstall")
 	log.Info("start")
 	defer log.Info("return")
 	details := log.V(1) // NOTE: Increment of level, not absolute.
+
+	var err error
+	details.Info("process cli options")
+	options, err = options.Populate(kubernetes.NewCLIOptionsReader(cmd))
+	if err != nil {
+		return err
+	}
+	details.Info("fill defaults into options")
+	options, err = options.Populate(kubernetes.NewDefaultOptionsReader())
+	if err != nil {
+		return err
+	}
+
+	details.Info("show option configuration")
+	c.showInstallConfiguration(options)
+
+	domain, err := options.GetOpt("system_domain", "")
+	if err != nil {
+		return err
+	}
+
+	details.Info("ensure system-domain")
+	err = c.fillInMissingSystemDomain(domain)
+	if err != nil {
+		return err
+	}
+
+	extensions, err := options.GetOpt("extensions", "")
+	if err != nil {
+		return err
+	}
+	exts := extensions.Value.([]string)
+	core := deployments.Core{}
+	if len(exts) == 0 && core.Installed(c.kubeClient) {
+		details.Info("removing all registered extensions")
+
+		client := deployments.NewHttpClient(c.ui.Verbose())
+		registeredExts, err := deployments.GetRegisteredExtensions(options, client)
+		if err != nil {
+			return err
+		}
+		for _, ext := range registeredExts {
+			exts = append(exts, *ext.ID)
+		}
+	} else {
+		details.Info("removing selected extensions")
+	}
+	if err := c.handleExtensions("uninstall", exts, options, true); err != nil {
+		return err
+	}
 
 	c.ui.Note().Msg("FuseML uninstalling...")
 
@@ -142,8 +323,8 @@ func (c *InstallClient) Uninstall(cmd *cobra.Command) error {
 		&deployments.Tekton{Timeout: DefaultTimeoutSec},
 		&deployments.Registry{Timeout: DefaultTimeoutSec},
 		&deployments.Gitea{Timeout: DefaultTimeoutSec},
-		&deployments.Quarks{Timeout: DefaultTimeoutSec},
-		&deployments.Traefik{Timeout: DefaultTimeoutSec},
+		&deployments.Core{Timeout: DefaultTimeoutSec},
+		&deployments.Istio{Timeout: DefaultTimeoutSec},
 	} {
 		details.Info("remove", "Deployment", deployment.ID())
 		err := deployment.Delete(c.kubeClient, c.ui)
@@ -153,6 +334,113 @@ func (c *InstallClient) Uninstall(cmd *cobra.Command) error {
 	}
 
 	c.ui.Success().Msg("FuseML uninstalled.")
+
+	return nil
+}
+
+func (c *InstallClient) Upgrade(cmd *cobra.Command, options *kubernetes.InstallationOptions) error {
+	log := c.Log.WithName("Upgrade")
+	log.Info("start")
+	defer log.Info("return")
+	details := log.V(1)
+
+	c.ui.Note().Msg("FuseML upgrading...")
+
+	options, err := options.Populate(kubernetes.NewCLIOptionsReader(cmd))
+	if err != nil {
+		return err
+	}
+
+	domain, err := options.GetOpt("system_domain", "")
+	if err != nil {
+		return err
+	}
+	details.Info("ensure system-domain")
+	err = c.fillInMissingSystemDomain(domain)
+	if err != nil {
+		return err
+	}
+
+	for _, deployment := range []kubernetes.Deployment{
+		&deployments.Core{Timeout: DefaultTimeoutSec},
+	} {
+		details.Info("upgrade", "Deployment", deployment.ID())
+		err := deployment.Upgrade(c.kubeClient, c.ui, options.ForDeployment(deployment.ID()))
+		if err != nil {
+			return err
+		}
+	}
+
+	c.ui.Success().Msg("FuseML upgraded.")
+
+	return nil
+}
+
+func (c *InstallClient) Extensions(cmd *cobra.Command, options *kubernetes.InstallationOptions) error {
+	log := c.Log.WithName("Extensions")
+	log.Info("start")
+	defer log.Info("return")
+	details := log.V(1)
+
+	c.ui.Note().Msg("FuseML handling the extensions...")
+
+	details.Info("process cli options")
+	options, err := options.Populate(kubernetes.NewCLIOptionsReader(cmd))
+	if err != nil {
+		return err
+	}
+	details.Info("fill defaults into options")
+	options, err = options.Populate(kubernetes.NewDefaultOptionsReader())
+	if err != nil {
+		return err
+	}
+
+	domain, err := options.GetOpt("system_domain", "")
+	if err != nil {
+		return err
+	}
+
+	details.Info("ensure system-domain")
+	err = c.fillInMissingSystemDomain(domain)
+	if err != nil {
+		return err
+	}
+
+	addExtensions, err := options.GetOpt("add", "")
+	if err != nil {
+		return err
+	}
+
+	details.Info("installing extensions")
+	if err := c.handleExtensions("install", addExtensions.Value.([]string), options, true); err != nil {
+		return err
+	}
+
+	removeExtensions, err := options.GetOpt("remove", "")
+	if err != nil {
+		return err
+	}
+
+	withDeps, err := options.GetBool("with_dependencies", "")
+	if err != nil {
+		return err
+	}
+
+	details.Info("removing extensions")
+	if err := c.handleExtensions("uninstall", removeExtensions.Value.([]string), options, withDeps); err != nil {
+		return err
+	}
+
+	doList, err := options.GetBool("list", "")
+	if err != nil {
+		return err
+	}
+	if doList {
+		details.Info("listing extensions")
+		if err := c.listRegisteredExtensions(options); err != nil {
+			return err
+		}
+	}
 
 	return nil
 }
@@ -177,6 +465,11 @@ func (c *InstallClient) showInstallConfiguration(opts *kubernetes.InstallationOp
 
 func (c *InstallClient) fillInMissingSystemDomain(domain *kubernetes.InstallationOption) error {
 	if domain.Value.(string) == "" {
+		coreDomain := c.fetchExistingDomain()
+		if coreDomain != "" {
+			domain.Value = coreDomain
+			return nil
+		}
 		service := "traefik"
 		if c.kubeClient.HasIstio() {
 			service = "istio-ingressgateway"
@@ -199,12 +492,31 @@ func (c *InstallClient) fillInMissingSystemDomain(domain *kubernetes.Installatio
 		}
 
 		if ip != "" {
-			domain.Value = fmt.Sprintf("%s.omg.howdoi.website", ip)
+			domain.Value = fmt.Sprintf("%s.nip.io", ip)
 		}
 
 	}
 
 	return nil
+}
+
+/* Check if core service is already installed; if so, fetch its its address
+ * from VirtualService
+ */
+func (c *InstallClient) fetchExistingDomain() string {
+	if !c.kubeClient.HasIstio() {
+		return ""
+	}
+
+	core := deployments.Core{}
+	if core.Installed(c.kubeClient) {
+		coreURL, err := helpers.Kubectl(fmt.Sprintf("get VirtualService -n fuseml-core fuseml-core -o jsonpath='{.spec.hosts[0]}'"))
+		if err == nil {
+			return coreURL[len("fuseml-core."):]
+		}
+		// no reason to fail on error, we can use other means for fetching ip...
+	}
+	return ""
 }
 
 func (c *InstallClient) fetchIP(ip *string, service string) error {

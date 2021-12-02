@@ -9,13 +9,10 @@ import (
 	"github.com/fuseml/fuseml/cli/cmd/internal/client"
 	"github.com/fuseml/fuseml/cli/kubernetes/config"
 	pconfig "github.com/fuseml/fuseml/cli/paas/config"
+	"github.com/fuseml/fuseml/cli/paas/version"
 	"github.com/kyokomi/emoji"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
-)
-
-const (
-	Version = "0.1"
 )
 
 var (
@@ -29,10 +26,10 @@ func Execute() {
 	ExitfIfError(checkDependencies(), "Cannot operate")
 
 	rootCmd := &cobra.Command{
-		Use:           "fuseml",
-		Short:         "Fuseml cli",
-		Long:          `fuseml cli is the official command line interface for Fuseml PaaS `,
-		Version:       fmt.Sprintf("%s", Version),
+		Use:           "fuseml-installer",
+		Short:         "FuseML installer",
+		Long:          `fuseml-installer cli is the official installation tool for FuseML `,
+		Version:       version.Version,
 		SilenceErrors: true,
 	}
 
@@ -51,20 +48,15 @@ func Execute() {
 	viper.BindPFlag("verbosity", pf.Lookup("verbosity"))
 	argToEnv["verbosity"] = "VERBOSITY"
 
-	client.CmdPush.Flags().StringVarP(&client.FlagServe, "serve", "s", "", "inference service to serve the model (kfserving, seldon_mlflow, seldon_sklearn, knative, deployment)")
-
 	config.AddEnvToUsage(rootCmd, argToEnv)
 
 	rootCmd.AddCommand(CmdCompletion)
 	rootCmd.AddCommand(client.CmdInstall)
 	rootCmd.AddCommand(client.CmdUninstall)
+	rootCmd.AddCommand(client.CmdUpgrade)
+	rootCmd.AddCommand(client.CmdExtensions)
 	rootCmd.AddCommand(client.CmdInfo)
-	rootCmd.AddCommand(client.CmdOrgs)
-	rootCmd.AddCommand(client.CmdCreateOrg)
-	rootCmd.AddCommand(client.CmdPush)
-	rootCmd.AddCommand(client.CmdDeleteApp)
-	rootCmd.AddCommand(client.CmdApps)
-	rootCmd.AddCommand(client.CmdTarget)
+	rootCmd.AddCommand(client.CmdVersion)
 
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Println(err)
@@ -80,9 +72,7 @@ func checkDependencies() error {
 	}{
 		{CommandName: "kubectl"},
 		{CommandName: "helm"},
-		{CommandName: "sh"},
 		{CommandName: "git"},
-		{CommandName: "openssl"},
 	}
 
 	for _, dependency := range dependencies {

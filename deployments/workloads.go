@@ -10,6 +10,7 @@ import (
 	"github.com/kyokomi/emoji"
 	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -24,6 +25,16 @@ const (
 	WorkloadsIngressVersion = "0.1"
 	appIngressYamlPath      = "app-ingress.yaml"
 )
+
+var roleRules = []rbacv1.PolicyRule{{
+	APIGroups: []string{""},
+	Resources: []string{"secrets", "serviceaccounts"},
+	Verbs:     []string{"get", "create", "patch"},
+}, {
+	APIGroups: []string{"apps"},
+	Resources: []string{"deployments"},
+	Verbs:     []string{"get", "list", "watch"},
+}}
 
 func (k *Workloads) ID() string {
 	return WorkloadsDeploymentID
@@ -77,7 +88,7 @@ func (w Workloads) Delete(c *kubernetes.Cluster, ui *ui.UI) error {
 }
 
 func (w Workloads) apply(c *kubernetes.Cluster, ui *ui.UI, options kubernetes.InstallationOptions) error {
-	if err := w.createWorkloadsNamespace(c, ui); err != nil {
+	if err := w.createWorkloadsNamespace(c, ui, options); err != nil {
 		return err
 	}
 
@@ -131,16 +142,13 @@ func (k Workloads) Upgrade(c *kubernetes.Cluster, ui *ui.UI, options kubernetes.
 	return nil
 }
 
-func (w Workloads) createWorkloadsNamespace(c *kubernetes.Cluster, ui *ui.UI) error {
+func (w Workloads) createWorkloadsNamespace(c *kubernetes.Cluster, ui *ui.UI, options kubernetes.InstallationOptions) error {
 	if _, err := c.Kubectl.CoreV1().Namespaces().Create(
 		context.Background(),
 		&corev1.Namespace{
 			ObjectMeta: metav1.ObjectMeta{
-				Name: WorkloadsDeploymentID,
-				Labels: map[string]string{
-					"quarks.cloudfoundry.org/monitored": "quarks-secret",
-					kubernetes.FusemlDeploymentLabelKey: kubernetes.FusemlDeploymentLabelValue,
-				},
+				Name:   WorkloadsDeploymentID,
+				Labels: map[string]string{kubernetes.FusemlDeploymentLabelKey: kubernetes.FusemlDeploymentLabelValue},
 			},
 		},
 		metav1.CreateOptions{},
@@ -151,13 +159,16 @@ func (w Workloads) createWorkloadsNamespace(c *kubernetes.Cluster, ui *ui.UI) er
 	if err := c.LabelNamespace(WorkloadsDeploymentID, kubernetes.FusemlDeploymentLabelKey, kubernetes.FusemlDeploymentLabelValue); err != nil {
 		return err
 	}
-	if err := w.createGiteaCredsSecret(c); err != nil {
-		return err
-	}
-	if err := w.createClusterRegistryCredsSecret(c); err != nil {
+	if err := w.createGiteaCredsSecret(c, options); err != nil {
 		return err
 	}
 	if err := w.createWorkloadsServiceAccountWithSecretAccess(c); err != nil {
+		return err
+	}
+	if err := w.createWorkloadsRole(c); err != nil {
+		return err
+	}
+	if err := w.createWorkloadsRoleBinding(c); err != nil {
 		return err
 	}
 
@@ -205,40 +216,18 @@ func (w Workloads) deleteWorkloadsNamespace(c *kubernetes.Cluster, ui *ui.UI) er
 	return nil
 }
 
-func (w Workloads) createClusterRegistryCredsSecret(c *kubernetes.Cluster) error {
-	// TODO: Are all of these really used? We need tekton to be able to access
-	// the registry and also kubernetes (when we deploy our app deployments)
-	auths := `{ "auths": {
-		"https://127.0.0.1:30500":{"auth": "YWRtaW46cGFzc3dvcmQ=", "username":"admin","password":"password"},
-		"http://127.0.0.1:30501":{"auth": "YWRtaW46cGFzc3dvcmQ=", "username":"admin","password":"password"},
-		 "registry.fuseml-registry":{"username":"admin","password":"password"},
-		 "registry.fuseml-registry:444":{"username":"admin","password":"password"} } }`
-
-	_, err := c.Kubectl.CoreV1().Secrets(WorkloadsDeploymentID).Create(context.Background(),
-		&corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: "registry-creds",
-			},
-			StringData: map[string]string{
-				".dockerconfigjson": auths,
-			},
-			Type: "kubernetes.io/dockerconfigjson",
-		}, metav1.CreateOptions{})
-
+func (w Workloads) createGiteaCredsSecret(c *kubernetes.Cluster, options kubernetes.InstallationOptions) error {
+	domain, err := options.GetString("system_domain", GiteaDeploymentID)
 	if err != nil {
 		return err
 	}
-	return nil
-}
-
-func (w Workloads) createGiteaCredsSecret(c *kubernetes.Cluster) error {
-	_, err := c.Kubectl.CoreV1().Secrets(WorkloadsDeploymentID).Create(context.Background(),
+	giteaSubdomain := GiteaDeploymentID + "." + domain
+	_, err = c.Kubectl.CoreV1().Secrets(WorkloadsDeploymentID).Create(context.Background(),
 		&corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: "gitea-creds",
 				Annotations: map[string]string{
-					//"kpack.io/git": fmt.Sprintf("http://%s.%s", GiteaDeploymentID, domain),
-					"tekton.dev/git-0": "http://gitea-http.gitea:10080", // TODO: Don't hardcode
+					"tekton.dev/git-0": fmt.Sprintf("http://%s", giteaSubdomain),
 				},
 			},
 			StringData: map[string]string{
@@ -254,23 +243,77 @@ func (w Workloads) createGiteaCredsSecret(c *kubernetes.Cluster) error {
 	return nil
 }
 
-// Adding the imagePullSecrets to the service account attached to the application
-// pods, will automatically assign the same imagePullSecrets to the pods themselves:
-// https://kubernetes.io/docs/tasks/configure-pod-container/configure-service-account/#verify-imagepullsecrets-was-added-to-pod-spec
 func (w Workloads) createWorkloadsServiceAccountWithSecretAccess(c *kubernetes.Cluster) error {
-	automountServiceAccountToken := false
+	automountServiceAccountToken := true
 	_, err := c.Kubectl.CoreV1().ServiceAccounts(WorkloadsDeploymentID).Create(
 		context.Background(),
 		&corev1.ServiceAccount{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: WorkloadsDeploymentID,
 			},
-			ImagePullSecrets: []corev1.LocalObjectReference{
-				{Name: "registry-creds"},
-				{Name: "gitea-creds"},
-			},
+			Secrets:                      []corev1.ObjectReference{{Name: "gitea-creds"}},
 			AutomountServiceAccountToken: &automountServiceAccountToken,
 		}, metav1.CreateOptions{})
 
+	return err
+}
+
+func (w Workloads) createWorkloadsRole(c *kubernetes.Cluster) error {
+	_, err := c.Kubectl.RbacV1().Roles(WorkloadsDeploymentID).Create(
+		context.Background(),
+		&rbacv1.Role{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: WorkloadsDeploymentID,
+			},
+			Rules: roleRules,
+		}, metav1.CreateOptions{})
+	return err
+}
+
+// Update the role with new rule
+func (w Workloads) updateWorkloadsRole(c *kubernetes.Cluster, newRule rbacv1.PolicyRule) error {
+
+	role, err := c.Kubectl.RbacV1().Roles(WorkloadsDeploymentID).Get(
+		context.Background(),
+		WorkloadsDeploymentID,
+		metav1.GetOptions{},
+	)
+
+	for _, rule := range role.Rules {
+		// this is only a simple check for exact duplicates; we ignore the situation
+		// when e.g. the new rule is subset of existing one
+		if helpers.StringSlicesEqual(rule.APIGroups, newRule.APIGroups) &&
+			helpers.StringSlicesEqual(rule.Resources, newRule.Resources) &&
+			helpers.StringSlicesEqual(rule.Verbs, newRule.Verbs) {
+			return nil
+		}
+	}
+
+	role, err = c.Kubectl.RbacV1().Roles(WorkloadsDeploymentID).Update(
+		context.Background(),
+		&rbacv1.Role{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: WorkloadsDeploymentID,
+			},
+			Rules: append(role.Rules, newRule),
+		}, metav1.UpdateOptions{})
+
+	return err
+}
+
+func (w Workloads) createWorkloadsRoleBinding(c *kubernetes.Cluster) error {
+	_, err := c.Kubectl.RbacV1().RoleBindings(WorkloadsDeploymentID).Create(
+		context.Background(),
+		&rbacv1.RoleBinding{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: WorkloadsDeploymentID,
+			},
+			RoleRef: rbacv1.RoleRef{
+				APIGroup: "rbac.authorization.k8s.io",
+				Kind:     "Role",
+				Name:     WorkloadsDeploymentID,
+			},
+			Subjects: []rbacv1.Subject{{Kind: "ServiceAccount", Name: WorkloadsDeploymentID, Namespace: WorkloadsDeploymentID}},
+		}, metav1.CreateOptions{})
 	return err
 }

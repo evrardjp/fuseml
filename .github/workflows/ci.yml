@@ -1,0 +1,143 @@
+name: CI
+
+on:
+  workflow_call:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - release-*
+    paths-ignore:
+      - docs/**
+      - README.md
+      - LICENSE
+      - .gitlint
+      - .gitignore
+      - install.sh
+  pull_request:
+    branches:
+      - main
+      - release-*
+    paths-ignore:
+      - docs/**
+      - README.md
+      - LICENSE
+      - .gitlint
+      - .gitignore
+      - install.sh
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+
+      - name: Setup Go
+        uses: actions/setup-go@v2
+        with:
+          go-version: "^1.16"
+
+      - name: Cache Go modules
+        uses: actions/cache@v2
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ github.job }}-${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ github.job }}-${{ runner.os }}-go
+
+      - name: Lint
+        run: |
+          make lint
+
+  unit-tests:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+
+      - name: Setup Go
+        uses: actions/setup-go@v2
+        with:
+          go-version: "^1.16"
+
+      - name: Cache Go modules
+        uses: actions/cache@v2
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ github.job }}-${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ github.job }}-${{ runner.os }}-go-
+
+      - name: Setup Ginkgo Test Framework
+        run: |
+          go install github.com/onsi/ginkgo/ginkgo
+
+      - name: Run unit tests
+        run: |
+          make test
+
+  e2e:
+    name: "${{ matrix.target }}"
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: ["kserve", "seldon", "seldon-triton", "ovms"]
+
+    steps:
+      - name: Free disk space
+        run: |
+          echo "Available storage:"
+          df -h
+          echo
+          echo -n "  Removing: .NET (frees ~22GB)"
+          sudo rm -rf /usr/share/dotnet
+          echo "... done"
+          echo -n "  Removing: Android"
+          sudo rm -rf /usr/local/lib/android
+          echo "... done"
+          echo
+          echo "Available storage:"
+          df -h
+
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Setup Go
+        uses: actions/setup-go@v2
+        with:
+          go-version: "^1.16"
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v1
+
+      - name: Cache Go modules
+        uses: actions/cache@v2
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ github.job }}-${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ github.job }}-${{ runner.os }}-go-
+
+      - name: Build fuseml-installer
+        run: make build
+
+      - name: Install k3d
+        run: make k3d-install
+
+      - name: Create k8s cluster
+        run: make new-test-cluster
+
+      - name: Install FuseML with "${{ matrix.target }}" extension
+        run: |
+          ./dist/fuseml-installer version
+          DEBUG=true make fuseml-install-with-${{ matrix.target }}
+
+      - name: Run mlflow-e2e with "${{ matrix.target }}"
+        run: |
+          # extract the target branch in the context of which this job is running
+          branch=${{ github.base_ref }}
+          [[ -z "$branch" ]] && branch=${GITHUB_REF#refs/heads/}
+          RELEASE_BRANCH=$branch make mlflow-${{ matrix.target }}-e2e
